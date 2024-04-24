@@ -3,99 +3,209 @@ const std = @import("std");
 pub fn main() !void {
     var file_buf: [1024]u8 = undefined;
     const data = try std.fs.cwd().readFile("../computer_enhance/perfaware/part1/listing_0037_single_register_mov", &file_buf);
-
     const out_writer = std.io.getStdOut().writer();
-
-    // [][][][][][]|[]|[]||[][]|[][][]|[][][]
-    //    opcode    D  W   MOD   REG    R/M
 
     parse(out_writer, data);
 }
 
 fn parse(writer: anytype, data: []const u8) !void {
     var idx: usize = 0;
-    while (idx < data.len - 1) : (idx += 2) {
-        const slice = data[idx .. idx + 2];
-        std.debug.print("raw bytes, index {}:\t{any}\n", .{ idx, slice });
+    while (idx < data.len) {
+        const inst_slice = Instruction.getNext(data[idx..]);
 
-        const inst: Instruction = @bitCast(std.mem.readInt(u16, slice[0..2], .big));
-        const ops = inst.getOperands();
+        const opcode = Instruction.getOpcode(getOp(inst_slice).?);
+        const operands = Instruction.getOperands(inst_slice);
 
-        _ = try writer.print("{s} {s}, {s}\n", .{ @tagName(inst.getOpCode()), @tagName(ops[0]), @tagName(ops[1]) });
+        _ = try writer.print("{s} {s}, {s}\n", .{
+            @tagName(opcode),
+            @tagName(operands[0].reg.?),
+            @tagName(operands[1].reg.?),
+        });
+
+        idx += inst_slice.len;
     }
 }
 
-// packed struct fields are in reverse order, thats wild
-const Instruction = packed struct(u16) {
-    rm: u3,
-    reg: u3,
-    mod: u2,
-    // is our data transfer 16 bits?
-    // = false: 1 byte, true: 2 bytes (word, wide)
-    w: bool,
-    // is the destination to or from the register field?
-    // = false: REG field is destination (dest, source)
-    // = true: REG field is source (source, dest)
-    d: bool,
-    op: u6,
+const OpType = enum {
+    // MOVs
+    regmem_to_reg,
+    imm_to_regmem,
+    imm_to_reg,
+    mem_to_acc,
+    acc_to_mem,
+    segreg_to_reg,
+};
 
-    fn getOpCode(i: Instruction) OpCode {
-        return switch (i.op) {
-            0b100010 => .mov,
-            else => unreachable,
+fn getOp(data: []const u8) ?OpType {
+    const op = data[0];
+
+    const REGMEM_TO_REG_OP = 0b10001000;
+    const IMM_TO_REGMEM_OP = 0b11000110;
+    const IMM_TO_REG_OP = 0b11010000;
+    const MEM_TO_ACC_OP = 0b10100000;
+    const SEGREG_TO_REG_OP = 0b10001100;
+
+    if (op & REGMEM_TO_REG_OP == REGMEM_TO_REG_OP) {
+        return .regmem_to_reg;
+    }
+
+    if (op & IMM_TO_REGMEM_OP == IMM_TO_REGMEM_OP) {
+        return .imm_to_regmem;
+    }
+
+    if (op & IMM_TO_REG_OP == IMM_TO_REG_OP) {
+        return .imm_to_reg;
+    }
+
+    if (op & MEM_TO_ACC_OP == MEM_TO_ACC_OP) {
+        return .mem_to_acc;
+    }
+
+    if (op & SEGREG_TO_REG_OP == SEGREG_TO_REG_OP) {
+        return .segreg_to_reg;
+    }
+
+    return null;
+}
+
+test "getOp" {
+    const reg_to_reg = [_]u8{ 0b10001011, 0b11100100, 0b10101010, 0b10101010 };
+
+    try std.testing.expectEqual(.regmem_to_reg, getOp(&reg_to_reg));
+}
+
+// to get length of first parsed instruction, we need both mov type (1st byte) and mod value (2nd byte).
+fn getLength(data: []const u8) u8 {
+    const mov_type = getOp(data);
+
+    const mod: u2 = @truncate(data[1] >> 6);
+    const wide: bool = @as(u1, @truncate(data[0])) == 1;
+
+    return switch (mov_type.?) {
+        .regmem_to_reg => switch (mod) {
+            0b11 => 2,
+            0b00 => 2,
+            0b01 => 3,
+            0b10 => 4,
+        },
+        .imm_to_regmem => if (wide) 3 else 2,
+        .mem_to_acc => 2,
+        .segreg_to_reg => 4,
+        else => unreachable, // TODO: unreachables should be errors.
+    };
+}
+
+// TODO: do we really need an object for this? revise later
+const Instruction = struct {
+
+    // returns slice representing next valid instruction.
+    fn getNext(data: []const u8) []const u8 {
+        const inst_len = getLength(data);
+
+        return data[0..inst_len];
+    }
+
+    // assumes not immediate, which i guess is just always in the same place, lol
+    fn getDestinationBit(inst_data: []const u8) bool {
+        return @as(u1, @truncate(inst_data[0] >> 1)) == 1;
+    }
+
+    fn getWideBit(inst_data: []const u8) bool {
+        const op = getOp(inst_data);
+
+        return switch (op) {
+            .imm_to_reg => @as(u1, @truncate(inst_data[0] >> 3)) == 1,
+            else => @truncate(inst_data[0]),
         };
     }
 
-    fn getOperands(i: Instruction) [2]Register {
-        std.debug.print("getOperands instruction:\t{}\n", .{i});
-        if (i.mod != 0b11) {
-            // uh oh, only supporting register mode for now
-            unreachable;
+    fn getWide(data: []const u8, idx: usize) u16 {
+        std.debug.assert(data.len > idx + 1);
+        const sl = data[idx .. idx + 2];
+        // i think we actually want little endian here? seems like vals are ordered lo -> hi
+        return std.mem.readInt(u16, sl[0..2], .little);
+    }
+
+    fn getOpcode(op: OpType) OpCode {
+        return switch (op) {
+            .regmem_to_reg, .imm_to_regmem, .imm_to_reg, .mem_to_acc, .acc_to_mem, .segreg_to_reg => .mov,
+        };
+    }
+
+    fn getOperands(inst_data: []const u8) [2]Address {
+        const op = getOp(inst_data);
+        var addrs: [2]Address = undefined;
+
+        if (op == .regmem_to_reg) {
+            const mod: u2 = @truncate(inst_data[1] >> 6);
+            const wide: bool = @as(u1, @truncate(inst_data[0])) == 1;
+
+            const reg: u3 = @truncate(inst_data[1] >> 3);
+            const rm: u3 = @truncate(inst_data[1]);
+
+            switch (mod) {
+                0b11 => { // reg to reg
+                    const a = getRegister(reg, wide);
+                    const b = getRegister(rm, wide);
+
+                    addrs = [2]Address{ .{ .reg = a }, .{ .reg = b } };
+                },
+
+                else => unreachable,
+            }
         }
 
-        if (i.d) {
-            return .{ getRegister(i.reg, i.w), getRegister(i.rm, i.w) };
+        // TODO: this doesnt hold for certain ops.
+        if (!getDestinationBit(inst_data)) {
+            const swap = addrs[0];
+            addrs[0] = addrs[1];
+            addrs[1] = swap;
         }
 
-        return .{ getRegister(i.rm, i.w), getRegister(i.reg, i.w) };
+        return addrs;
+    }
+
+    fn getRegister(reg: u3, wide: bool) Register {
+        const high: bool = reg & 0b100 > 0;
+
+        // packed struct fields are in reverse order, thats wild
+        const Options = packed struct(u2) { wide: bool, high: bool };
+        const opts: u2 = @bitCast(Options{ .wide = wide, .high = high });
+
+        return switch (@as(u2, @truncate(reg))) {
+            0b00 => switch (opts) { // high, wide
+                0b11 => .sp,
+                0b01 => .ax,
+                0b10 => .ah,
+                0b00 => .al,
+            },
+            0b01 => switch (opts) {
+                0b11 => .bp,
+                0b01 => .cx,
+                0b10 => .ch,
+                0b00 => .cl,
+            },
+            0b10 => switch (opts) {
+                0b11 => .si,
+                0b01 => .dx,
+                0b10 => .dh,
+                0b00 => .dl,
+            },
+            0b11 => switch (opts) {
+                0b11 => .di,
+                0b01 => .bx,
+                0b10 => .bh,
+                0b00 => .bl,
+            },
+        };
     }
 };
 
-fn getRegister(reg: u8, wide: bool) Register {
-    const val: u2 = @truncate(reg & 0b11);
-    const high: bool = reg & 0b100 > 0;
-
-    const Options = packed struct(u2) { wide: bool, high: bool };
-
-    const opts: u2 = @bitCast(Options{ .wide = wide, .high = high });
-
-    return switch (val) {
-        0b00 => switch (opts) { // high, wide
-            0b11 => .sp,
-            0b01 => .ax,
-            0b10 => .ah,
-            0b00 => .al,
-        },
-        0b01 => switch (opts) {
-            0b11 => .bp,
-            0b01 => .cx,
-            0b10 => .ch,
-            0b00 => .cl,
-        },
-        0b10 => switch (opts) {
-            0b11 => .si,
-            0b01 => .dx,
-            0b10 => .dh,
-            0b00 => .dl,
-        },
-        0b11 => switch (opts) {
-            0b11 => .di,
-            0b01 => .bx,
-            0b10 => .bh,
-            0b00 => .bl,
-        },
-    };
-}
+const Address = struct {
+    reg: ?Register = null, // no register == immediate addresso
+    memreg: ?Register = null, // for SI, DI. Probably not the right name
+    offset: u16 = 0,
+};
 
 pub const OpCode = enum {
     mov,
@@ -142,16 +252,17 @@ fn compareToNasm(alloc: std.mem.Allocator, comptime listing: []const u8, args: A
     try parse(output_stream.writer(), binary_data);
 
     var output_file = try std.fs.cwd().createFile(listing ++ "_ours" ++ ".asm", .{});
+    std.debug.print("Output ASM:\n{s}\n", .{output_stream.getWritten()});
     _ = try output_file.writeAll(output_stream.getWritten());
 
-    defer std.fs.cwd().deleteFile(listing ++ "_ours" ++ ".asm") catch unreachable;
+    defer std.fs.cwd().deleteFile(listing ++ "_ours" ++ ".asm") catch {};
 
     // assemble our file
     const our_nasm_args = [_][]const u8{ "nasm", listing ++ "_ours" ++ ".asm", "-o", listing ++ "_ours" };
     child = std.process.Child.init(&our_nasm_args, alloc);
 
     _ = try child.spawnAndWait();
-    defer std.fs.cwd().deleteFile(listing ++ "_ours") catch unreachable;
+    defer std.fs.cwd().deleteFile(listing ++ "_ours") catch {};
 
     // get binary data
     var our_data_buf: [1024]u8 = undefined;
@@ -159,8 +270,8 @@ fn compareToNasm(alloc: std.mem.Allocator, comptime listing: []const u8, args: A
 
     if (args.print.?) {
         std.debug.print("LISTING: {s}\n", .{listing});
-        std.debug.print("Their binary:\n{x}\n", .{binary_data});
-        std.debug.print("Our binary:\n{x}\n", .{our_data});
+        std.debug.print("Their binary:\n{b}\n", .{binary_data});
+        std.debug.print("Our binary:\n{b}\n", .{our_data});
     }
     try std.testing.expectEqualSlices(u8, binary_data, our_data);
 
@@ -173,7 +284,7 @@ test "listing_0037" {
     const alloc = std.testing.allocator_instance.allocator();
     const listing = "listing_0037_single_register_mov";
 
-    try compareToNasm(alloc, listing, .{});
+    try compareToNasm(alloc, listing, .{ .print = true });
 }
 
 test "listing_0038" {
@@ -183,4 +294,9 @@ test "listing_0038" {
     try compareToNasm(alloc, listing, .{});
 }
 
-test "listing_0039" {}
+test "listing_0039" {
+    const alloc = std.testing.allocator_instance.allocator();
+    const listing = "listing_0039_more_movs";
+
+    try compareToNasm(alloc, listing, .{});
+}
