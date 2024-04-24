@@ -16,10 +16,11 @@ fn parse(writer: anytype, data: []const u8) !void {
         const opcode = Instruction.getOpcode(getOp(inst_slice).?);
         const operands = Instruction.getOperands(inst_slice);
 
+        // TODO: handle printing operand
         _ = try writer.print("{s} {s}, {s}\n", .{
             @tagName(opcode),
-            @tagName(operands[0].reg.?),
-            @tagName(operands[1].reg.?),
+            @tagName(operands[0].addr.reg.?),
+            @tagName(operands[1].addr.reg.?),
         });
 
         idx += inst_slice.len;
@@ -101,7 +102,6 @@ const Instruction = struct {
     // returns slice representing next valid instruction.
     fn getNext(data: []const u8) []const u8 {
         const inst_len = getLength(data);
-
         return data[0..inst_len];
     }
 
@@ -119,11 +119,22 @@ const Instruction = struct {
         };
     }
 
+    // returns value of least significant bit
+    fn boolFromBit(data: u8) bool {
+        return data & 0b1 > 0;
+    }
+
     fn getWide(data: []const u8, idx: usize) u16 {
-        std.debug.assert(data.len > idx + 1);
-        const sl = data[idx .. idx + 2];
+        // lets just truncate the slice if we don't have space
+        const sl = data[idx..@min(idx + 2, data.len)];
         // i think we actually want little endian here? seems like vals are ordered lo -> hi
-        return std.mem.readInt(u16, sl[0..2], .little);
+
+        return switch (sl.len) {
+            2 => std.mem.readInt(u16, sl[0..2], .little),
+            1 => sl[0],
+            0 => 0,
+            else => unreachable, // TODO: again with the dang unreachables
+        };
     }
 
     fn getOpcode(op: OpType) OpCode {
@@ -132,38 +143,98 @@ const Instruction = struct {
         };
     }
 
-    fn getOperands(inst_data: []const u8) [2]Address {
+    fn getOperands(inst_data: []const u8) [2]Operand {
         const op = getOp(inst_data);
-        var addrs: [2]Address = undefined;
+        var operands: [2]Operand = undefined;
 
         if (op == .regmem_to_reg) {
             const mod: u2 = @truncate(inst_data[1] >> 6);
-            const wide: bool = @as(u1, @truncate(inst_data[0])) == 1;
+            const wide: bool = boolFromBit(inst_data[0]);
 
             const reg: u3 = @truncate(inst_data[1] >> 3);
             const rm: u3 = @truncate(inst_data[1]);
 
-            switch (mod) {
-                0b11 => { // reg to reg
-                    const a = getRegister(reg, wide);
-                    const b = getRegister(rm, wide);
+            // usually starts at 3rd byte if its there
+            const disp: u16 = getWide(inst_data, 2);
 
-                    addrs = [2]Address{ .{ .reg = a }, .{ .reg = b } };
-                },
+            const a = getAddress(mod, reg, wide, disp);
+            const b = getAddress(mod, rm, wide, disp);
 
-                else => unreachable,
-            }
+            operands = .{
+                .{ .addr = a },
+                .{ .addr = b },
+            };
+        } else if (op == .imm_to_regmem) {
+            const mod: u2 = @truncate(inst_data[1] >> 6);
+            const wide: bool = boolFromBit(inst_data[0]);
+            const rm: u3 = @truncate(inst_data[1]);
+
+            const disp: u16 = getWide(inst_data, 2);
+            const data: u16 = getWide(inst_data, 4);
+
+            const addr: Address = getAddress(mod, rm, wide, disp);
+
+            operands = .{ .{ .addr = addr }, .{ .imm = data } };
         }
 
         // TODO: this doesnt hold for certain ops.
         if (!getDestinationBit(inst_data)) {
-            const swap = addrs[0];
-            addrs[0] = addrs[1];
-            addrs[1] = swap;
+            const swap = operands[0];
+            operands[0] = operands[1];
+            operands[1] = swap;
         }
 
-        return addrs;
+        return operands;
     }
+
+    // pass in displacement value even if it goes unused
+    fn getAddress(mod: u2, reg: u3, wide: bool, disp: u16) Address {
+        var address: Address = .{};
+
+        // handle direct address
+        if (mod == 0b00 and reg == 0b110) {
+            address.offset = 0;
+            return address; // lol i dont know what goes here actually
+        }
+
+        // handle just register
+        if (mod == 0b11) {
+            address.reg = getRegister(reg, wide);
+            return address;
+        }
+
+        // handle regmem, wow this is yucky
+        if (reg == 0b111) {
+            address.reg = .bx;
+        } else {
+            if (reg & 0b001 > 0) {
+                address.memreg = .di;
+            } else {
+                address.memreg = .si;
+            }
+
+            if (reg & 0b010 > 0) {
+                address.reg = .bp;
+            } else {
+                address.reg = .bx;
+            }
+
+            // toss B register in this case
+            if (reg & 0b100 > 0) {
+                address.reg = null;
+            }
+        }
+
+        address.offset = switch (mod) {
+            0b11, 0b00 => 0,
+            0b01 => @as(u8, @truncate(disp)),
+            0b10 => disp,
+        };
+
+        return address;
+    }
+
+    fn getMemReg() Address {}
 
     fn getRegister(reg: u3, wide: bool) Register {
         const high: bool = reg & 0b100 > 0;
@@ -204,8 +275,10 @@ const Instruction = struct {
 const Address = struct {
     reg: ?Register = null, // no register == immediate addresso
     memreg: ?Register = null, // for SI, DI. Probably not the right name
-    offset: u16 = 0,
+    offset: u16 = 0, // DISP
 };
+
+const Operand = union(enum) { addr: Address, imm: u16 };
 
 pub const OpCode = enum {
     mov,
