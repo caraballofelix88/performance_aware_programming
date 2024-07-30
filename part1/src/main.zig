@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
-    const listing = "listing_0041_add_sub_cmp_jnz";
+    const listing = "listing_0040_challenge_movs";
 
     try compareToNasm(alloc, listing, .{ .print = true });
 }
@@ -13,53 +13,59 @@ fn parse(writer: anytype, data: []const u8, args: Args) !void {
 
     while (idx < data.len) {
         const inst_slice = Instruction.getNext(data[idx..]);
+        const op = getOp(inst_slice);
 
         if (args.print) {
             std.debug.print("getOp bin: {b:0>8}\n", .{inst_slice});
-            std.debug.print("parsed op: {s}\n", .{@tagName(getOp(inst_slice).?)});
+            std.debug.print("parsed op: {?}\n", .{op});
             std.debug.print("getLen: {}\n", .{inst_slice.len});
         }
 
         const opcode = Instruction.getOpcode(inst_slice);
         const operands = Instruction.getOperands(inst_slice);
 
-        // TODO: handle printing operand
-        var op_a_str: [128]u8 = undefined;
-        var op_b_str: [128]u8 = undefined;
+        var ops_buf: [32]u8 = undefined;
+        const ops = switch (op.?) {
+            .ctrl_loop, .ctrl_jmp_conditional => operands[0..1],
+            else => operands[0..],
+        };
 
-        var rendered_a: []u8 = undefined;
-        var rendered_b: []u8 = undefined;
-
-        switch (operands[0]) {
-            .addr => |addr| {
-                rendered_a = @constCast(try addr.render(&op_a_str));
-            },
-            .imm => |val| {
-                rendered_a = op_a_str[0..std.fmt.formatIntBuf(&op_a_str, val, 10, .lower, .{})];
-            },
-        }
-
-        switch (operands[1]) {
-            .addr => |addr| {
-                rendered_b = @constCast(try addr.render(&op_b_str));
-            },
-            .imm => |val| {
-                rendered_b = op_b_str[0..std.fmt.formatIntBuf(&op_b_str, val, 10, .lower, .{})];
-            },
-        }
+        const ops_str = std.mem.trim(u8, try renderOperands(ops, &ops_buf), "\xaa");
 
         if (args.print) {
-            std.debug.print("parsed:\t{s} {s}, {s}\n\n", .{ @tagName(opcode), rendered_a, rendered_b });
+            std.debug.print("parsed:\t{s} {s}\n\n", .{ @tagName(opcode), ops_str });
         }
 
-        _ = try writer.print("{s} {s}, {s}\n", .{
-            @tagName(opcode),
-            rendered_a,
-            rendered_b,
-        });
+        _ = try writer.print("{s} {s}\n", .{ @tagName(opcode), ops_str });
 
         idx += inst_slice.len;
     }
+}
+
+fn renderOperands(operands: []const Operand, buf: []u8) ![]u8 {
+    var local_buf: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&local_buf);
+    const alloc = fba.allocator();
+
+    var list = std.ArrayList([]const u8).init(alloc);
+    defer list.deinit();
+
+    for (operands) |op| {
+        var op_buf = try alloc.alloc(u8, 32);
+        const op_str = switch (op) {
+            .addr => |addr| @constCast(try addr.render(op_buf)),
+            .imm => |val| op_buf[0..std.fmt.formatIntBuf(op_buf, val, 10, .lower, .{})],
+        };
+
+        const trimmed = std.mem.trim(u8, op_str, "\xaa");
+        try list.append(trimmed);
+    }
+
+    const joined = try std.mem.join(alloc, ", ", list.items);
+
+    std.mem.copyForwards(u8, buf, joined);
+
+    return buf;
 }
 
 const OpType = enum {
@@ -76,7 +82,9 @@ const OpType = enum {
     add_imm_to_reg,
     add_imm_from_acc,
 
-    //control TK
+    //control
+    ctrl_jmp_conditional,
+    ctrl_loop,
 };
 
 const REGMEM_TO_REG_OP = 0b10001000;
@@ -89,8 +97,20 @@ const ADD_REGMEM_TO_REGMEM_OP = 0b00000000;
 const ADD_IMM_TO_REG_OP = 0b10000000;
 const ADD_IMM_FROM_ACC_OP = 0b00000100;
 
+const CTRL_LOOP_OP = 0b11100000;
+const CTRL_JMP_COND_OP = 0b01110000;
+
+// TODO: probably a better way to look through opcode masks
 fn getOp(data: []const u8) ?OpType {
     const op = data[0];
+
+    if (op & CTRL_LOOP_OP == CTRL_LOOP_OP) {
+        return .ctrl_loop;
+    }
+
+    if (op & CTRL_JMP_COND_OP == CTRL_JMP_COND_OP) {
+        return .ctrl_jmp_conditional;
+    }
 
     // NOTE: masking an imm_to_reg op can match the mask for regmem_to_reg, so we check for imm_to_reg first
     if (op & IMM_TO_REG_OP == IMM_TO_REG_OP) {
@@ -138,7 +158,7 @@ test "getOp" {
 
 // to get length of first parsed instruction, we need both mov type (1st byte) and mod value (2nd byte).
 fn getLength(data: []const u8) u8 {
-    const mov_type = getOp(data);
+    const op_type = getOp(data);
 
     const mod: u2 = @truncate(data[1] >> 6);
     const rm: u3 = @truncate(data[1]);
@@ -148,7 +168,7 @@ fn getLength(data: []const u8) u8 {
 
     const direct_address_disp: u8 = if (mod == 0b00 and rm == 0b110) 2 else 0;
 
-    const len: u8 = switch (mov_type.?) {
+    const len: u8 = switch (op_type.?) {
         .regmem_to_reg, .add_regmem_to_regmem => switch (mod) {
             0b11 => 2,
             0b00 => 2,
@@ -170,6 +190,8 @@ fn getLength(data: []const u8) u8 {
         .mem_to_acc, .acc_to_mem => 3,
         .segreg_to_reg => 4,
         .imm_to_reg, .add_imm_from_acc => if (wide) 3 else 2,
+
+        .ctrl_jmp_conditional, .ctrl_loop => 2,
     };
 
     return len + direct_address_disp;
@@ -212,7 +234,6 @@ test "getLength" {
 }
 
 // gets least significant bit of val as boolean
-// TODO: replace goofy inline casts w this
 pub fn bitFlag(val: anytype) bool {
     return @bitCast(@as(u1, @truncate(val)));
 }
@@ -244,21 +265,16 @@ const Instruction = struct {
         };
     }
 
-    // returns value of least significant bit
-    fn boolFromBit(data: u8) bool {
-        return data & 0b1 > 0;
-    }
-
     fn getWide(data: []const u8, idx: usize) u16 {
         // lets just yank whatevers at the end of the slice if we're exceeding bounds
         const sl = data[@min(idx, data.len - 1)..@min(idx + 2, data.len)];
-        // i think we actually want little endian here? seems like vals are ordered lo -> hi
 
+        // i think we actually want little endian here? seems like vals are ordered lo -> hi
         return switch (sl.len) {
             2 => std.mem.readInt(u16, sl[0..2], .little),
             1 => sl[0],
             0 => 0,
-            else => unreachable, // TODO: again with the dang unreachables
+            else => unreachable,
         };
     }
 
@@ -284,6 +300,30 @@ const Instruction = struct {
                     else => unreachable,
                 };
             },
+            .ctrl_jmp_conditional => switch (@as(u4, @truncate(data[0]))) {
+                0b0100 => .je,
+                0b1100 => .jl,
+                0b1110 => .jle,
+                0b0010 => .jb,
+                0b0110 => .jbe,
+                0b1010 => .jp,
+                0b0000 => .jo,
+                0b1000 => .js,
+                0b0101 => .jne,
+                0b1101 => .jnl,
+                0b1111 => .jnle,
+                0b0011 => .jnb,
+                0b0111 => .jnbe,
+                0b1011 => .jnp,
+                0b0001 => .jno,
+                0b1001 => .jns,
+            },
+            .ctrl_loop => switch (@as(u2, @truncate(data[0]))) {
+                0b10 => .loop,
+                0b01 => .loopz,
+                0b00 => .loopnz,
+                0b11 => .jczx,
+            },
         };
     }
 
@@ -291,12 +331,12 @@ const Instruction = struct {
         const op = getOp(inst_data);
         const wide = getWideBit(inst_data);
 
+        const mod: u2 = @truncate(inst_data[1] >> 6);
+        const reg: u3 = @truncate(inst_data[1] >> 3);
+        const rm: u3 = @truncate(inst_data[1]);
+
         var operands: [2]Operand = switch (op.?) {
             .regmem_to_reg, .add_regmem_to_regmem => blk: {
-                const mod: u2 = @truncate(inst_data[1] >> 6);
-
-                const reg: u3 = @truncate(inst_data[1] >> 3);
-                const rm: u3 = @truncate(inst_data[1]);
 
                 // usually starts at 3rd byte if its there
                 const disp: u16 = getWide(inst_data, 2);
@@ -310,9 +350,6 @@ const Instruction = struct {
                 };
             },
             .imm_to_regmem, .add_imm_to_reg => blk: {
-                const mod: u2 = @truncate(inst_data[1] >> 6);
-                const rm: u3 = @truncate(inst_data[1]);
-
                 const disp: u16 = getWide(inst_data, 2);
                 const data: u16 = getWide(inst_data, 4);
 
@@ -321,8 +358,6 @@ const Instruction = struct {
                 break :blk .{ .{ .addr = addr }, .{ .imm = data } };
             },
             .imm_to_reg => blk: {
-                const reg: u3 = @truncate(inst_data[0]);
-
                 const data: u16 = if (wide) getWide(inst_data, 1) else inst_data[1];
 
                 break :blk .{
@@ -336,29 +371,30 @@ const Instruction = struct {
 
                 break :blk .{ .{ .addr = addr }, .{ .imm = data } };
             },
+
+            .ctrl_loop, .ctrl_jmp_conditional => blk: {
+                const data: u16 = getWide(inst_data, 1);
+                // we toss the second operand
+                break :blk .{ .{ .imm = data }, .{ .imm = 0 } };
+            },
             else => unreachable,
         };
 
-        // TODO: this doesnt hold for certain ops.
         if (getDestinationBit(inst_data)) {
             std.mem.swap(Operand, &operands[0], &operands[1]);
-            // const swap = operands[0];
-            // operands[0] = operands[1];
-            // operands[1] = swap;
         }
 
         return operands;
     }
 
-    // pass in displacement value even if it goes unused
     fn getAddress(mod: u2, reg: u3, wide: bool, disp: u16) Address {
         var address: Address = .{};
 
-        // TODO: handle direct address
+        // direct address
         if (mod == 0b00 and reg == 0b110) {
             address.indirect = true;
             address.offset = disp;
-            return address; // lol i dont know what goes here actually
+            return address;
         }
 
         // handle just register
@@ -443,7 +479,7 @@ const Address = struct {
     memreg: ?Register = null, // for SI, DI. Probably not the right name
     offset: u16 = 0, // DISP
     offset_wide: bool = false, // 8bits if false, 16 if true
-    indirect: bool = false, // indicates the address is to be derived from here
+    indirect: bool = false, // indicates the address is stored as a value
 
     pub fn render(a: Address, buf: []u8) ![]const u8 {
         var local_buf: [256]u8 = undefined;
@@ -480,7 +516,33 @@ const Address = struct {
 
 const Operand = union(enum) { addr: Address, imm: u16 };
 
-pub const OpCode = enum { mov, add, adc, sub, cmp };
+pub const OpCode = enum {
+    mov,
+    add,
+    adc,
+    sub,
+    cmp,
+    je,
+    jl,
+    jle,
+    jb,
+    jbe,
+    jp,
+    jo,
+    js,
+    jne,
+    jnl,
+    jnle,
+    jnb,
+    jnbe,
+    jnp,
+    jno,
+    jns,
+    loop,
+    loopz,
+    loopnz,
+    jczx,
+};
 
 // memory address: number and/or Register
 pub const Register = enum {
@@ -515,10 +577,10 @@ fn compareToNasm(alloc: std.mem.Allocator, comptime listing: []const u8, args: A
     defer std.fs.cwd().deleteFile(listing) catch unreachable;
 
     // get binary data
-    var binary_data_buf: [2048]u8 = undefined;
+    var binary_data_buf: [4096]u8 = undefined;
     const binary_data = try std.fs.cwd().readFile(listing, &binary_data_buf);
 
-    var output_buf: [2048]u8 = undefined;
+    var output_buf: [4096]u8 = undefined;
     var output_stream = std.io.fixedBufferStream(&output_buf);
 
     try parse(output_stream.writer(), binary_data, args);
@@ -582,6 +644,7 @@ test "listing_0040" {
     try compareToNasm(alloc, listing, .{ .print = true });
 }
 
+// NOTE: jump labels will bork this, likely
 test "listing_0041" {
     const alloc = std.testing.allocator_instance.allocator();
     const listing = "listing_0041_add_sub_cmp_jnz";

@@ -1,3 +1,7 @@
-zig-cache
-zig-out
-nasm.out
+computer_enhance
+.kitty-session.conf
+
+**/zig-cache
+**/.zig-cache
+**/zig-out
+**/nasm.out
